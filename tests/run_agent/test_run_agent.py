@@ -151,6 +151,41 @@ def test_aiagent_reuses_existing_errors_log_handler():
             root_logger.addHandler(handler)
 
 
+def test_aiagent_passes_configured_default_headers_to_openai_client():
+    captured = {}
+
+    def _fake_openai(**kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    with (
+        patch(
+            "run_agent.get_tool_definitions",
+            return_value=_make_tool_defs("web_search"),
+        ),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("hermes_logging.setup_logging"),
+        patch("run_agent.OpenAI", side_effect=_fake_openai),
+    ):
+        AIAgent(
+            api_key="test-key",
+            base_url="https://sub2api.example.test/v1",
+            provider="custom",
+            api_mode="codex_responses",
+            model="gpt-5.4",
+            default_headers={
+                "User-Agent": "odex_vscode/0.104.0-alpha.1",
+            },
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assert captured["default_headers"] == {
+        "User-Agent": "odex_vscode/0.104.0-alpha.1",
+    }
+
+
 class TestProviderModelNormalization:
     def test_aiagent_strips_matching_native_provider_prefix(self):
         with (

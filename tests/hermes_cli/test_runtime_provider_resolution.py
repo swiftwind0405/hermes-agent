@@ -832,6 +832,48 @@ def test_named_custom_provider_uses_key_env_from_providers_dict(monkeypatch):
     assert resolved["model"] == "acme-large"
 
 
+def test_named_custom_provider_uses_headers_from_providers_dict(monkeypatch):
+    """providers dict entries with headers should propagate to runtime config."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("SUB2API_API_KEY", "sub2api-secret")
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "sub2api": {
+                    "base_url": "https://sub2api.example.test/v1",
+                    "key_env": "SUB2API_API_KEY",
+                    "name": "sub2api",
+                    "transport": "codex_responses",
+                    "headers": {
+                        "User-Agent": "odex_vscode/0.104.0-alpha.1",
+                    },
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_provider",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError(
+                "resolve_provider should not be called for named custom providers"
+            )
+        ),
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="sub2api")
+
+    assert resolved["provider"] == "custom"
+    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["api_key"] == "sub2api-secret"
+    assert resolved["default_headers"] == {
+        "User-Agent": "odex_vscode/0.104.0-alpha.1",
+    }
+
+
 def test_named_custom_provider_falls_back_to_openai_api_key(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "env-openai-key")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)

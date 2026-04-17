@@ -2092,6 +2092,7 @@ class HermesCLI:
         self.api_mode = "chat_completions"
         self.acp_command: Optional[str] = None
         self.acp_args: list[str] = []
+        self.default_headers: dict[str, str] = {}
         self.base_url = (
             base_url
             or CLI_CONFIG["model"].get("base_url", "")
@@ -3343,6 +3344,9 @@ class HermesCLI:
         resolved_api_mode = runtime.get("api_mode", self.api_mode)
         resolved_acp_command = runtime.get("command")
         resolved_acp_args = list(runtime.get("args") or [])
+        resolved_default_headers = runtime.get("default_headers")
+        if not isinstance(resolved_default_headers, dict):
+            resolved_default_headers = {}
         resolved_credential_pool = runtime.get("credential_pool")
         if not isinstance(api_key, str) or not api_key:
             # Custom / local endpoints (llama.cpp, ollama, vLLM, etc.) often
@@ -3373,11 +3377,13 @@ class HermesCLI:
             or resolved_api_mode != self.api_mode
             or resolved_acp_command != self.acp_command
             or resolved_acp_args != self.acp_args
+            or resolved_default_headers != self.default_headers
         )
         self.provider = resolved_provider
         self.api_mode = resolved_api_mode
         self.acp_command = resolved_acp_command
         self.acp_args = resolved_acp_args
+        self.default_headers = dict(resolved_default_headers)
         self._credential_pool = resolved_credential_pool
         self._provider_source = runtime.get("source")
         self.api_key = api_key
@@ -3444,6 +3450,7 @@ class HermesCLI:
             "api_mode": self.api_mode,
             "command": self.acp_command,
             "args": list(self.acp_args or []),
+            "default_headers": dict(self.default_headers or {}),
             "credential_pool": getattr(self, "_credential_pool", None),
         }
         route = {
@@ -3456,6 +3463,7 @@ class HermesCLI:
                 runtime["api_mode"],
                 runtime["command"],
                 tuple(runtime["args"]),
+                tuple(sorted(runtime["default_headers"].items())),
             ),
         }
 
@@ -3556,6 +3564,7 @@ class HermesCLI:
                 "api_mode": self.api_mode,
                 "command": self.acp_command,
                 "args": list(self.acp_args or []),
+                "default_headers": dict(self.default_headers or {}),
                 "credential_pool": getattr(self, "_credential_pool", None),
             }
             effective_model = model_override or self.model
@@ -3567,6 +3576,7 @@ class HermesCLI:
                 api_mode=runtime.get("api_mode"),
                 acp_command=runtime.get("command"),
                 acp_args=runtime.get("args"),
+                default_headers=runtime.get("default_headers"),
                 credential_pool=runtime.get("credential_pool"),
                 max_iterations=self.max_turns,
                 enabled_toolsets=self.enabled_toolsets,
@@ -3616,6 +3626,7 @@ class HermesCLI:
                 runtime.get("api_mode"),
                 runtime.get("command"),
                 tuple(runtime.get("args") or ()),
+                tuple(sorted((runtime.get("default_headers") or {}).items())),
             )
 
             if self._pending_title and self._session_db:

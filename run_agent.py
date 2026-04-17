@@ -935,6 +935,7 @@ class AIAgent:
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
         service_tier: str = None,
+        default_headers: Dict[str, str] = None,
         request_overrides: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
@@ -1208,6 +1209,11 @@ class AIAgent:
         self.max_tokens = max_tokens  # None = use model default
         self.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
         self.service_tier = service_tier
+        self.default_headers = {
+            str(k).strip(): str(v)
+            for k, v in (default_headers or {}).items()
+            if str(k).strip() and v is not None
+        }
         self.request_overrides = dict(request_overrides or {})
         self.prefill_messages = prefill_messages or []  # Prefilled conversation turns
         self._force_ascii_payload = False
@@ -1440,7 +1446,12 @@ class AIAgent:
                     client_kwargs["default_headers"] = _qwen_portal_headers()
                 elif base_url_host_matches(effective_base, "chatgpt.com"):
                     from agent.auxiliary_client import _codex_cloudflare_headers
+
                     client_kwargs["default_headers"] = _codex_cloudflare_headers(api_key)
+                if self.default_headers:
+                    headers = dict(client_kwargs.get("default_headers") or {})
+                    headers.update(self.default_headers)
+                    client_kwargs["default_headers"] = headers
             else:
                 # No explicit creds — use the centralized provider router
                 from agent.auxiliary_client import resolve_provider_client
@@ -6149,6 +6160,10 @@ class AIAgent:
             )
         else:
             self._client_kwargs.pop("default_headers", None)
+        if getattr(self, "default_headers", None):
+            headers = dict(self._client_kwargs.get("default_headers") or {})
+            headers.update(self.default_headers)
+            self._client_kwargs["default_headers"] = headers
 
     def _swap_credential(self, entry) -> None:
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")

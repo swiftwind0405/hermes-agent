@@ -1367,6 +1367,12 @@ def list_authenticated_providers(
     # produces two picker rows: one bare-slug ("openrouter") from section 3
     # and one "custom:openrouter" from section 4, both labelled identically.
     _section3_emitted_pairs: set = set()
+    # Track user provider identities so Section 4 can ignore compatibility
+    # custom_providers entries synthesized from the same ``providers:`` dict.
+    # Without this, the Telegram /model picker shows e.g. both ``dm2api`` and
+    # ``custom:dm2api`` for one configured endpoint.
+    user_provider_keys: set[str] = set()
+    user_provider_custom_slugs: set[str] = set()
     if user_providers and isinstance(user_providers, dict):
         for ep_name, ep_cfg in user_providers.items():
             if not isinstance(ep_cfg, dict):
@@ -1454,6 +1460,10 @@ def list_authenticated_providers(
             )
             if _pair[0] and _pair[1]:
                 _section3_emitted_pairs.add(_pair)
+            ep_key = str(ep_name).strip().lower()
+            user_provider_keys.add(ep_key)
+            user_provider_custom_slugs.add(custom_provider_slug(str(ep_name)))
+            user_provider_custom_slugs.add(custom_provider_slug(str(display_name)))
 
     # --- 4. Saved custom providers from config ---
     # Each ``custom_providers`` entry represents one model under a named
@@ -1481,6 +1491,7 @@ def list_authenticated_providers(
                 continue
 
             raw_name = (entry.get("name") or "").strip()
+            provider_key = str(entry.get("provider_key") or "").strip().lower()
             api_url = (
                 entry.get("base_url", "")
                 or entry.get("url", "")
@@ -1490,6 +1501,11 @@ def list_authenticated_providers(
             if not raw_name or not api_url:
                 continue
             api_key = (entry.get("api_key") or "").strip()
+            raw_slug = custom_provider_slug(raw_name)
+            if provider_key and provider_key in user_provider_keys:
+                continue
+            if raw_slug in user_provider_custom_slugs:
+                continue
 
             group_key = (api_url, api_key)
             if group_key not in groups:

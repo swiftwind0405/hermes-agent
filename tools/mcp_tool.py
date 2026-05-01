@@ -164,6 +164,7 @@ def _write_stderr_log_header(server_name: str) -> None:
 
 _MCP_AVAILABLE = False
 _MCP_HTTP_AVAILABLE = False
+_MCP_SSE_AVAILABLE = False
 _MCP_SAMPLING_TYPES = False
 _MCP_NOTIFICATION_TYPES = False
 _MCP_MESSAGE_HANDLER_SUPPORTED = False
@@ -180,6 +181,11 @@ try:
         _MCP_HTTP_AVAILABLE = True
     except ImportError:
         _MCP_HTTP_AVAILABLE = False
+    try:
+        from mcp.client.sse import sse_client
+        _MCP_SSE_AVAILABLE = True
+    except ImportError:
+        _MCP_SSE_AVAILABLE = False
     # Prefer the non-deprecated API (mcp >= 1.24.0); fall back to the
     # deprecated wrapper for older SDK versions.
     try:
@@ -904,6 +910,20 @@ class MCPServerTask:
         """Check if this server uses HTTP transport."""
         return "url" in self._config
 
+    def _http_transport_kind(self, config: dict) -> str:
+        """Return the HTTP transport kind for a server config.
+
+        Supports explicit ``transport: sse`` / ``streamable_http`` and
+        infers legacy SSE for URLs ending in ``/sse``.
+        """
+        transport = str(config.get("transport") or "").strip().lower().replace("-", "_")
+        if transport in {"sse", "streamable_http"}:
+            return transport
+        url = str(config.get("url") or "").rstrip("/").lower()
+        if url.endswith("/sse"):
+            return "sse"
+        return "streamable_http"
+
     # ----- Dynamic tool discovery (notifications/tools/list_changed) -----
 
     async def _refresh_tools_task(self):
@@ -1141,8 +1161,16 @@ class MCPServerTask:
                         _orphan_stdio_pids.add(pid)
 
     async def _run_http(self, config: dict):
-        """Run the server using HTTP/StreamableHTTP transport."""
-        if not _MCP_HTTP_AVAILABLE:
+        """Run the server using HTTP/StreamableHTTP or legacy SSE transport."""
+        transport_kind = self._http_transport_kind(config)
+        if transport_kind == "sse":
+            if not _MCP_SSE_AVAILABLE:
+                raise ImportError(
+                    f"MCP server '{self.name}' requires SSE transport but "
+                    "mcp.client.sse is not available. Upgrade the mcp package "
+                    "to get SSE support."
+                )
+        elif not _MCP_HTTP_AVAILABLE:
             raise ImportError(
                 f"MCP server '{self.name}' requires HTTP transport but "
                 "mcp.client.streamable_http is not available. "
@@ -1181,7 +1209,40 @@ class MCPServerTask:
         if _MCP_NOTIFICATION_TYPES and _MCP_MESSAGE_HANDLER_SUPPORTED:
             sampling_kwargs["message_handler"] = self._make_message_handler()
 
-        if _MCP_NEW_HTTP:
+        if transport_kind == "sse":
+            import httpx
+
+            def _make_sse_http_client(headers=None, timeout=None, auth=None):
+                return httpx.AsyncClient(
+                    http2=True,
+                    follow_redirects=True,
+                    headers=headers,
+                    timeout=timeout,
+                    auth=auth,
+                )
+
+            _sse_kwargs: dict = {
+                "headers": headers,
+                "timeout": float(connect_timeout),
+                "sse_read_timeout": 300.0,
+                "httpx_client_factory": _make_sse_http_client,
+            }
+            if _oauth_auth is not None:
+                _sse_kwargs["auth"] = _oauth_auth
+
+            async with sse_client(url, **_sse_kwargs) as (read_stream, write_stream):
+                async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
+                    await session.initialize()
+                    self.session = session
+                    await self._discover_tools()
+                    self._ready.set()
+                    reason = await self._wait_for_lifecycle_event()
+                    if reason == "reconnect":
+                        logger.info(
+                            "MCP server '%s': reconnect requested — "
+                            "tearing down SSE session", self.name,
+                        )
+        elif _MCP_NEW_HTTP:
             # New API (mcp >= 1.24.0): build an explicit httpx.AsyncClient
             # matching the SDK's own create_mcp_http_client defaults.
             import httpx
@@ -1547,6 +1608,88 @@ def _is_auth_error(exc: BaseException) -> bool:
     return True
 
 
+def _request_server_reconnect(server_name: str, wait_timeout: float = 15.0) -> bool:
+    """Ask a running MCP server task to rebuild its session.
+
+    Returns True when a reconnect signal was sent and a non-None session became
+    visible again before ``wait_timeout`` elapsed.
+    """
+    with _lock:
+        srv = _servers.get(server_name)
+    if srv is None or not hasattr(srv, "_reconnect_event"):
+        return False
+
+    loop = _mcp_loop
+    if loop is None or not loop.is_running():
+        return False
+
+    loop.call_soon_threadsafe(srv._reconnect_event.set)
+    deadline = time.monotonic() + wait_timeout
+    while time.monotonic() < deadline:
+        if srv.session is not None and srv._ready.is_set():
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def _is_retryable_connection_error(exc: BaseException) -> bool:
+    """Return True for transport/lifecycle errors that warrant one reconnect.
+
+    These errors happen when a long-lived MCP session gets torn down underneath
+    a tool call (e.g. anyio ClosedResourceError or HTTP/2 stream resets).
+    """
+    try:
+        import anyio
+
+        if isinstance(exc, (anyio.ClosedResourceError, anyio.BrokenResourceError, anyio.EndOfStream)):
+            return True
+    except Exception:
+        pass
+
+    try:
+        import httpx
+
+        if isinstance(exc, (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError, httpx.ConnectError)):
+            return True
+    except Exception:
+        pass
+
+    exc_name = type(exc).__name__
+    return exc_name in {"ClosedResourceError", "BrokenResourceError", "EndOfStream", "RemoteProtocolError"}
+
+
+def _handle_transient_connection_error_and_retry(
+    server_name: str,
+    exc: BaseException,
+    retry_call,
+    op_description: str,
+):
+    """Attempt one reconnect+retry for transient transport/lifecycle failures."""
+    if not _is_retryable_connection_error(exc):
+        return None
+
+    if not _request_server_reconnect(server_name, wait_timeout=15.0):
+        return None
+
+    try:
+        result = retry_call()
+        try:
+            parsed = json.loads(result)
+            if "error" not in parsed:
+                _server_error_counts[server_name] = 0
+                return result
+        except (json.JSONDecodeError, TypeError):
+            _server_error_counts[server_name] = 0
+            return result
+    except Exception as retry_exc:
+        logger.warning(
+            "MCP %s/%s retry after reconnect failed: %s",
+            server_name, op_description, retry_exc,
+        )
+
+    return None
+
+
 def _handle_auth_error_and_retry(
     server_name: str,
     exc: BaseException,
@@ -1600,20 +1743,7 @@ def _handle_auth_error_and_retry(
         recovered = False
 
     if recovered:
-        with _lock:
-            srv = _servers.get(server_name)
-        if srv is not None and hasattr(srv, "_reconnect_event"):
-            loop = _mcp_loop
-            if loop is not None and loop.is_running():
-                loop.call_soon_threadsafe(srv._reconnect_event.set)
-                # Wait briefly for the session to come back ready. Bounded
-                # so that a stuck reconnect falls through to the error
-                # path rather than hanging the caller.
-                deadline = time.monotonic() + 15
-                while time.monotonic() < deadline:
-                    if srv.session is not None and srv._ready.is_set():
-                        break
-                    time.sleep(0.25)
+        _request_server_reconnect(server_name, wait_timeout=15.0)
 
         # A successful OAuth recovery is independent evidence that the
         # server is viable again, so close the circuit breaker here —
@@ -2082,6 +2212,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             )
             if recovered is not None:
                 return recovered
+
+            transient = _handle_transient_connection_error_and_retry(
+                server_name, exc, _call_once,
+                f"tools/call {tool_name}",
+            )
+            if transient is not None:
+                return transient
 
             _bump_server_error(server_name)
             logger.error(

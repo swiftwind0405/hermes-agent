@@ -476,6 +476,44 @@ class TestToolHandler:
         finally:
             _servers.pop("test_srv", None)
 
+    def test_transient_closed_resource_reconnects_and_retries(self):
+        import anyio
+        from tools import mcp_tool
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        old_session = MagicMock()
+        old_session.call_tool = AsyncMock(side_effect=anyio.ClosedResourceError())
+        new_session = MagicMock()
+        new_session.call_tool = AsyncMock(
+            return_value=_make_call_result("recovered", is_error=False)
+        )
+
+        server = _make_mock_server("test_srv", session=old_session)
+        server._ready.set()
+        reconnect_mock = MagicMock()
+        server._reconnect_event = reconnect_mock
+        _servers["test_srv"] = server
+
+        class _FakeLoop:
+            def is_running(self):
+                return True
+
+            def call_soon_threadsafe(self, fn, *args):
+                server.session = new_session
+                fn(*args)
+
+        try:
+            handler = _make_tool_handler("test_srv", "greet", 120)
+            with self._patch_mcp_loop(), patch("tools.mcp_tool._mcp_loop", _FakeLoop()):
+                result = json.loads(handler({"name": "world"}))
+            assert result["result"] == "recovered"
+            reconnect_mock.set.assert_called_once()
+            old_session.call_tool.assert_awaited_once_with("greet", arguments={"name": "world"})
+            new_session.call_tool.assert_awaited_once_with("greet", arguments={"name": "world"})
+        finally:
+            _servers.pop("test_srv", None)
+            mcp_tool._server_error_counts.pop("test_srv", None)
+
     def test_interrupted_call_returns_interrupted_error(self):
         from tools.mcp_tool import _make_tool_handler, _servers
 
@@ -1437,6 +1475,50 @@ class TestHTTPConfig:
         }, new_http=False))
         assert captured["legacy_headers"]["MCP-Protocol-Version"] == "custom-version"
         assert "mcp-protocol-version" not in captured["legacy_headers"]
+
+    def test_sse_url_uses_sse_client(self):
+        from tools.mcp_tool import LATEST_PROTOCOL_VERSION, MCPServerTask
+
+        server = MCPServerTask("remote")
+        config = {"url": "https://example.com/api/mcp/sse"}
+
+        mock_read = object()
+        mock_write = object()
+        mock_sse_ctx = AsyncMock()
+        mock_sse_ctx.__aenter__.return_value = (mock_read, mock_write)
+        mock_sse_ctx.__aexit__.return_value = False
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
+        mock_session_ctx = AsyncMock()
+        mock_session_ctx.__aenter__.return_value = mock_session
+        mock_session_ctx.__aexit__.return_value = False
+
+        async def _stop_immediately(self):
+            self._shutdown_event.set()
+            return "shutdown"
+
+        async def _test():
+            with patch("tools.mcp_tool._MCP_HTTP_AVAILABLE", True), \
+                 patch("tools.mcp_tool._MCP_SSE_AVAILABLE", True), \
+                 patch("tools.mcp_tool.sse_client", return_value=mock_sse_ctx) as mock_sse_client, \
+                 patch("tools.mcp_tool.ClientSession", return_value=mock_session_ctx), \
+                 patch.object(MCPServerTask, "_wait_for_lifecycle_event", _stop_immediately):
+                await server._run_http(config)
+
+            mock_sse_client.assert_called_once()
+            assert mock_sse_client.call_args.args[0] == config["url"]
+            assert mock_sse_client.call_args.kwargs["timeout"] == 60.0
+            assert mock_sse_client.call_args.kwargs["sse_read_timeout"] == 300.0
+            assert mock_sse_client.call_args.kwargs["headers"] == {
+                "mcp-protocol-version": LATEST_PROTOCOL_VERSION,
+            }
+            assert "httpx_client_factory" in mock_sse_client.call_args.kwargs
+            mock_session.initialize.assert_awaited_once()
+            mock_session.list_tools.assert_awaited_once()
+
+        asyncio.run(_test())
 
 
 # ---------------------------------------------------------------------------

@@ -131,6 +131,72 @@ def test_list_authenticated_providers_enumerates_dict_format_models(monkeypatch)
     ]
 
 
+def test_list_authenticated_providers_dedupes_compat_custom_provider_rows(monkeypatch):
+    """Compatibility custom_providers synthesized from providers: should not add duplicate rows.
+
+    Regression: gateway /model passes both cfg['providers'] and
+    get_compatible_custom_providers(cfg).  That made Telegram show both
+    'dm2api' and 'custom:dm2api' for the same configured endpoint.
+    """
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+
+    user_providers = {
+        "dm2api": {
+            "name": "dm2api",
+            "base_url": "https://dm2api.example/v1",
+            "key_env": "DM2API_KEY",
+            "transport": "codex_responses",
+            "default_model": "gpt-5.5",
+            "models": ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"],
+        },
+        "sub2api": {
+            "name": "sub2api",
+            "base_url": "https://sub2api.example/v1",
+            "key_env": "SUB2API_KEY",
+            "transport": "codex_responses",
+            "default_model": "gpt-5.5",
+            "models": ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"],
+        },
+    }
+    compat_custom_providers = [
+        {
+            "name": "dm2api",
+            "base_url": "https://dm2api.example/v1",
+            "provider_key": "dm2api",
+            "key_env": "DM2API_KEY",
+            "api_mode": "codex_responses",
+            "model": "gpt-5.5",
+        },
+        {
+            "name": "sub2api",
+            "base_url": "https://sub2api.example/v1",
+            "provider_key": "sub2api",
+            "key_env": "SUB2API_KEY",
+            "api_mode": "codex_responses",
+            "model": "gpt-5.5",
+        },
+    ]
+
+    providers = list_authenticated_providers(
+        current_provider="dm2api",
+        user_providers=user_providers,
+        custom_providers=compat_custom_providers,
+        max_models=50,
+    )
+
+    slugs = [p["slug"] for p in providers]
+    assert "dm2api" in slugs
+    assert "sub2api" in slugs
+    assert "custom:dm2api" not in slugs
+    assert "custom:sub2api" not in slugs
+    assert slugs.count("dm2api") == 1
+    assert slugs.count("sub2api") == 1
+    dm2api = next(p for p in providers if p["slug"] == "dm2api")
+    assert dm2api["api_url"] == "https://dm2api.example/v1"
+    assert dm2api["models"] == ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
+
+
 def test_list_authenticated_providers_uses_live_models_for_user_provider(monkeypatch):
     """User-defined OpenAI-compatible providers should prefer live /models.
 
